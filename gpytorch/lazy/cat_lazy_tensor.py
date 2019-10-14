@@ -6,6 +6,8 @@ from .non_lazy_tensor import lazify, NonLazyTensor
 from . import delazify
 from ..utils.broadcasting import _mul_broadcast_shape, _matmul_broadcast_shape
 from ..utils.getitem import _noop_index
+from .. import settings
+from ..utils.deprecation import bool_compat
 
 
 def cat(inputs, dim=0, output_device=None):
@@ -16,7 +18,7 @@ def cat(inputs, dim=0, output_device=None):
 
     if all(isinstance(i, NonLazyTensor) for i in inputs):
         # Dont form a CatLazyTensor if all tensors are NonLazyTensor
-        return lazify(torch.cat([delazify(i) for i in inputs]))
+        return lazify(torch.cat([delazify(i) for i in inputs], dim=dim))
 
     if output_device is None and all(i.device == inputs[0].device for i in inputs):
         output_device = inputs[0].device
@@ -131,12 +133,12 @@ class CatLazyTensor(LazyTensor):
     def _get_indices(self, row_index, col_index, *batch_indices):
         indices = [*batch_indices, row_index, col_index]
         target_shape = _mul_broadcast_shape(*[index.shape for index in indices])
-        indices = [index.expand(target_shape).contiguous().view(-1) for index in indices]
+        indices = [index.expand(target_shape).reshape(-1) for index in indices]
         cat_dim_indices = indices[self.cat_dim]
 
         # Find out for which indices we switch to different tensors
         target_tensors = self.idx_to_tensor_idx[cat_dim_indices]
-        does_switch_tensor = torch.ones(target_tensors.numel() + 1, dtype=torch.uint8, device=self.device)
+        does_switch_tensor = torch.ones(target_tensors.numel() + 1, dtype=bool_compat, device=self.device)
         torch.ne(target_tensors[:-1], target_tensors[1:], out=does_switch_tensor[1:-1])
 
         # Get the LazyTensors that will comprise the new LazyTensor
@@ -188,7 +190,7 @@ class CatLazyTensor(LazyTensor):
         elif torch.is_tensor(cat_dim_indices):
             # Find out for which indices we switch to different tensors
             target_tensors = self.idx_to_tensor_idx[cat_dim_indices]
-            does_switch_tensor = torch.ones(target_tensors.numel() + 1, dtype=torch.uint8, device=self.device)
+            does_switch_tensor = torch.ones(target_tensors.numel() + 1, dtype=bool_compat, device=self.device)
             torch.ne(target_tensors[:-1], target_tensors[1:], out=does_switch_tensor[1:-1])
 
             # Get the LazyTensors that will comprise the new LazyTensor
@@ -251,9 +253,11 @@ class CatLazyTensor(LazyTensor):
                 index[-2] = slice(curr_idx, curr_idx + size, None)
                 res_list.append(t._matmul(rhs[index]))
                 curr_idx += size
-            # copy result back to output device
+            # copy result back to output device and sum
             res_list = [x.to(output_device) for x in res_list]
-            res = torch.sum(torch.stack(res_list), dim=0)
+            res = 0.
+            for x in res_list:
+                res = res + x
         else:
             output_shape = _matmul_broadcast_shape(self.shape, rhs.shape)
             rhs = rhs.expand(*output_shape[:-2], *rhs.shape[-2:])
@@ -299,6 +303,35 @@ class CatLazyTensor(LazyTensor):
         res = self.__class__(
             *lazy_tensors, dim=(cat_dim + 1 if dim <= cat_dim else cat_dim), output_device=self.output_device
         )
+        return res
+
+    def diag(self):
+        if settings.debug.on():
+            if not self.is_square:
+                raise RuntimeError("Diag works on square matrices (or batches)")
+
+        if self.cat_dim == -2:
+            res = []
+            curr_col = 0
+            for t in self.lazy_tensors:
+                n_rows, n_cols = t.shape[-2:]
+                rows = torch.arange(0, n_rows, dtype=torch.long, device=t.device)
+                cols = torch.arange(curr_col, curr_col + n_rows, dtype=torch.long, device=t.device)
+                res.append(t[..., rows, cols].to(self.device))
+                curr_col += n_rows
+            res = torch.cat(res, dim=-1)
+        elif self.cat_dim == -1:
+            res = []
+            curr_row = 0
+            for t in self.lazy_tensors:
+                n_rows, n_cols = t.shape[-2:]
+                rows = torch.arange(curr_row, curr_row + n_cols, dtype=torch.long, device=t.device)
+                cols = torch.arange(0, n_cols, dtype=torch.long, device=t.device)
+                curr_row += n_cols
+                res.append(t[..., rows, cols].to(self.device))
+            res = torch.cat(res, dim=-1)
+        else:
+            res = torch.cat([t.diag().to(self.device) for t in self.lazy_tensors], dim=self.cat_dim + 1)
         return res
 
     def inv_quad_logdet(self, inv_quad_rhs=None, logdet=False, reduce_inv_quad=True):

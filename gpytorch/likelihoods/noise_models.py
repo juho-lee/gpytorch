@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 from torch.nn import Parameter
 
+from .. import settings
 from ..constraints import GreaterThan
 from ..distributions import MultivariateNormal
 from ..lazy import DiagLazyTensor, ZeroLazyTensor
@@ -56,7 +57,7 @@ class _HomoskedasticNoiseBase(Noise):
         self.initialize(raw_noise=self.raw_noise_constraint.inverse_transform(value))
 
     def forward(
-        self, *params: Any, shape: Optional[torch.Size] = None
+        self, *params: Any, shape: Optional[torch.Size] = None, **kwargs: Any,
     ) -> DiagLazyTensor:
         """In the homoskedastic case, the parameters are only used to infer the required shape.
         Here are the possible scenarios:
@@ -73,7 +74,11 @@ class _HomoskedasticNoiseBase(Noise):
         input batch shapes. `n` and the input batch shape are determined either from the shape arg or from the params
         input. For this it is sufficient to take in a single `shape` arg, with the convention that shape[:-1] is the
         batch shape of the input, and shape[-1] is `n`.
+
+        If a "noise" kwarg (a Tensor) is provided, this noise is used directly.
         """
+        if "noise" in kwargs:
+            return DiagLazyTensor(kwargs.get("noise"))
         if shape is None:
             p = params[0] if torch.is_tensor(params[0]) else params[0][0]
             shape = p.shape if len(p.shape) == 1 else p.shape[:-1]
@@ -125,17 +130,26 @@ class HeteroskedasticNoise(Noise):
         self.noise_model = noise_model
         self._noise_constraint = noise_constraint
         self._noise_indices = noise_indices
+        # make sure to clear test caches after backpropagating through them
+        self.register_backward_hook(clear_cache_hook)
 
     def forward(
         self,
         *params: Any,
         batch_shape: Optional[torch.Size] = None,
-        shape: Optional[torch.Size] = None
+        shape: Optional[torch.Size] = None,
+        noise: Optional[Tensor] = None,
     ) -> DiagLazyTensor:
-        if len(params) == 1 and not torch.is_tensor(params[0]):
-            output = self.noise_model(*params[0])
-        else:
-            output = self.noise_model(*params)
+        if noise is not None:
+            return DiagLazyTensor(noise)
+        training = self.noise_model.training  # keep track of mode
+        self.noise_model.eval()  # we want the posterior prediction of the noise model
+        with settings.detach_test_caches(False), settings.debug(False):
+            if len(params) == 1 and not torch.is_tensor(params[0]):
+                output = self.noise_model(*params[0])
+            else:
+                output = self.noise_model(*params)
+        self.noise_model.train(training)
         if not isinstance(output, MultivariateNormal):
             raise NotImplementedError(
                 "Currently only noise models that return a MultivariateNormal are supported"
@@ -176,3 +190,10 @@ class FixedGaussianNoise(Module):
     def _apply(self, fn):
         self.noise = fn(self.noise)
         return super(FixedGaussianNoise, self)._apply(fn)
+
+
+def clear_cache_hook(module, grad_input, grad_output) -> None:
+    try:
+        module.noise_model.prediction_strategy = None
+    except AttributeError:
+        pass

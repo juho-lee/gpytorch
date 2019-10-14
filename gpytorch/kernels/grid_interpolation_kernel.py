@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import torch
+from .kernel import Kernel
 from .grid_kernel import GridKernel
 from ..lazy import InterpolatedLazyTensor
 from ..models.exact_prediction_strategies import InterpolatedPredictionStrategy
 from ..utils.interpolation import Interpolation
+from typing import Union, List, Optional, Tuple
+from gpytorch.utils.grid import create_grid
 
 
 class GridInterpolationKernel(GridKernel):
@@ -47,8 +50,9 @@ class GridInterpolationKernel(GridKernel):
     Args:
         - :attr:`base_kernel` (Kernel):
             The kernel to approximate with KISS-GP
-        - :attr:`grid_size` (int):
-            The size of the grid (in each dimension)
+        - :attr:`grid_size` (Union[int, List[int]]):
+            The size of the grid in each dimension.
+            If a single int is provided, then every dimension will have the same grid size.
         - :attr:`num_dims` (int):
             The dimension of the input data. Required if `grid_bounds=None`
         - :attr:`grid_bounds` (tuple(float, float), optional):
@@ -62,7 +66,14 @@ class GridInterpolationKernel(GridKernel):
         http://proceedings.mlr.press/v37/wilson15.pdf
     """
 
-    def __init__(self, base_kernel, grid_size, num_dims=None, grid_bounds=None, active_dims=None):
+    def __init__(
+        self,
+        base_kernel: Kernel,
+        grid_size: Union[int, List[int]],
+        num_dims: int = None,
+        grid_bounds: Optional[Tuple[float, float]] = None,
+        active_dims: Tuple[int, ...] = None,
+    ):
         has_initialized_grid = 0
         grid_is_dynamic = True
 
@@ -84,31 +95,29 @@ class GridInterpolationKernel(GridKernel):
                     "grid_bounds ({})".format(num_dims, len(grid_bounds))
                 )
 
+        if isinstance(grid_size, int):
+            grid_sizes = [grid_size for _ in range(num_dims)]
+        else:
+            grid_sizes = list(grid_size)
+
+        if len(grid_sizes) != num_dims:
+            raise RuntimeError("The number of grid sizes provided through grid_size do not match num_dims.")
+
         # Initialize values and the grid
         self.grid_is_dynamic = grid_is_dynamic
         self.num_dims = num_dims
-        self.grid_size = grid_size
+        self.grid_sizes = grid_sizes
         self.grid_bounds = grid_bounds
-        grid = self._create_grid()
+        grid = create_grid(self.grid_sizes, self.grid_bounds)
 
         super(GridInterpolationKernel, self).__init__(
             base_kernel=base_kernel, grid=grid, interpolation_mode=True, active_dims=active_dims
         )
-        self.register_buffer("has_initialized_grid", torch.tensor(has_initialized_grid, dtype=torch.uint8))
-
-    def _create_grid(self):
-        grid = torch.zeros(self.grid_size, len(self.grid_bounds))
-        for i in range(len(self.grid_bounds)):
-            grid_diff = float(self.grid_bounds[i][1] - self.grid_bounds[i][0]) / (self.grid_size - 2)
-            grid[:, i] = torch.linspace(
-                self.grid_bounds[i][0] - grid_diff, self.grid_bounds[i][1] + grid_diff, self.grid_size
-            )
-
-        return grid
+        self.register_buffer("has_initialized_grid", torch.tensor(has_initialized_grid, dtype=torch.bool))
 
     @property
     def _tight_grid_bounds(self):
-        grid_spacings = tuple((bound[1] - bound[0]) / self.grid_size for bound in self.grid_bounds)
+        grid_spacings = tuple((bound[1] - bound[0]) / self.grid_sizes[i] for i, bound in enumerate(self.grid_bounds))
         return tuple(
             (bound[0] + 2.01 * spacing, bound[1] - 2.01 * spacing)
             for bound, spacing in zip(self.grid_bounds, grid_spacings)
@@ -121,7 +130,7 @@ class GridInterpolationKernel(GridKernel):
             n_dimensions = 1
         batch_shape = inputs.shape[:-2]
 
-        inputs = inputs.contiguous().view(-1, n_dimensions)
+        inputs = inputs.reshape(-1, n_dimensions)
         interp_indices, interp_values = Interpolation().interpolate(self.grid, inputs)
         interp_indices = interp_indices.view(*batch_shape, n_data, -1)
         interp_values = interp_values.view(*batch_shape, n_data, -1)
@@ -134,9 +143,9 @@ class GridInterpolationKernel(GridKernel):
         # See if we need to update the grid or not
         if self.grid_is_dynamic:  # This is true if a grid_bounds wasn't passed in
             if torch.equal(x1, x2):
-                x = x1.contiguous().view(-1, self.num_dims)
+                x = x1.reshape(-1, self.num_dims)
             else:
-                x = torch.cat([x1.contiguous().view(-1, self.num_dims), x2.contiguous().view(-1, self.num_dims)])
+                x = torch.cat([x1.reshape(-1, self.num_dims), x2.reshape(-1, self.num_dims)])
             x_maxs = x.max(0)[0].tolist()
             x_mins = x.min(0)[0].tolist()
 
@@ -150,12 +159,14 @@ class GridInterpolationKernel(GridKernel):
 
             # Update the grid if needed
             if update_grid:
-                grid_spacings = tuple((x_max - x_min) / (self.grid_size - 4.02) for x_min, x_max in zip(x_mins, x_maxs))
+                grid_spacings = tuple(
+                    (x_max - x_min) / (gs - 4.02) for gs, x_min, x_max in zip(self.grid_sizes, x_mins, x_maxs)
+                )
                 self.grid_bounds = tuple(
                     (x_min - 2.01 * spacing, x_max + 2.01 * spacing)
                     for x_min, x_max, spacing in zip(x_mins, x_maxs, grid_spacings)
                 )
-                grid = self._create_grid()
+                grid = create_grid(self.grid_sizes, self.grid_bounds)
                 self.update_grid(grid)
 
         base_lazy_tsr = self._inducing_forward(last_dim_is_batch=last_dim_is_batch, **params)
@@ -186,6 +197,3 @@ class GridInterpolationKernel(GridKernel):
 
     def prediction_strategy(self, train_inputs, train_prior_dist, train_labels, likelihood):
         return InterpolatedPredictionStrategy(train_inputs, train_prior_dist, train_labels, likelihood)
-
-    def num_outputs_per_input(self, x1, x2):
-        return self.base_kernel.num_outputs_per_input(x1, x2)

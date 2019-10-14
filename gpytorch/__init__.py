@@ -24,7 +24,6 @@ from .functions import (
     logdet,
     log_normal_cdf,
     matmul,
-    normal_cdf,
     root_decomposition,
     root_inv_decomposition,
     # Deprecated
@@ -35,7 +34,7 @@ from .mlls import ExactMarginalLogLikelihood, VariationalMarginalLogLikelihood
 from .lazy import lazify, delazify, cat
 
 
-__version__ = "0.3.4"
+__version__ = "0.3.6"
 
 __all__ = [
     # Submodules
@@ -66,7 +65,6 @@ __all__ = [
     "logdet",
     "log_normal_cdf",
     "matmul",
-    "normal_cdf",
     "root_decomposition",
     "root_inv_decomposition",
     # Context managers

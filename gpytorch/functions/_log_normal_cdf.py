@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import math
-from . import NormalCDF
 from torch.autograd import Function
 import torch
+from torch.distributions import Normal
 
 
 class LogNormalCDF(Function):
-    def forward(self, z):
+    @staticmethod
+    def forward(ctx, z):
         c = torch.tensor(
             [
                 0.00048204,
@@ -59,7 +60,7 @@ class LogNormalCDF(Function):
         # Three cases to handle: An entry of z is near zero, an entry of z is small, or an entry of z neither of these.
         z_near_zero = z.pow(2).lt(0.04)
         z_is_small = z.lt(-1)
-        z_is_ordinary = (1 - z_near_zero).mul_(1 - z_is_small)
+        z_is_ordinary = ~(z_near_zero | z_is_small)
 
         # Case 1: Entries of z that are near zero
         if z_near_zero.sum() > 0:
@@ -87,23 +88,24 @@ class LogNormalCDF(Function):
             e = numerator.div(denominator)
             log_phi_z.masked_scatter_(z_is_small, torch.log(e / 2) - z_where_z_is_small.pow(2).div_(2))
 
-            self.denominator = denominator
-            self.numerator = numerator
+            ctx.denominator = denominator
+            ctx.numerator = numerator
 
-        log_phi_z.masked_scatter_(z_is_ordinary, torch.log(NormalCDF().forward(z.masked_select(z_is_ordinary))))
+        log_phi_z.masked_scatter_(z_is_ordinary, torch.log(Normal(0., 1.).cdf(z.masked_select(z_is_ordinary))))
 
-        self.save_for_backward(z, log_phi_z)
+        ctx.save_for_backward(z, log_phi_z)
         return log_phi_z
 
-    def backward(self, grad_output):
-        z, log_phi_z = self.saved_tensors
+    @staticmethod
+    def backward(ctx, grad_output):
+        z, log_phi_z = ctx.saved_tensors
         log_phi_z_grad = torch.zeros_like(z)
 
         z_is_small = z.lt(-1)
-        z_is_not_small = 1 - z_is_small
+        z_is_not_small = ~z_is_small
 
         if z_is_small.sum() > 0:
-            log_phi_z_grad[z_is_small] = torch.abs(self.denominator.div(self.numerator)).mul(math.sqrt(2 / math.pi))
+            log_phi_z_grad[z_is_small] = torch.abs(ctx.denominator.div(ctx.numerator)).mul(math.sqrt(2 / math.pi))
 
         exp = z[z_is_not_small].pow(2).div(-2).sub(log_phi_z[z_is_not_small]).add(math.log(0.5))
 

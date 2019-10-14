@@ -20,8 +20,6 @@ from ..utils.deprecation import _deprecate_renamed_methods
 from ..utils.gradients import _ensure_symmetric_grad
 from ..utils.getitem import _noop_index, _convert_indices_to_tensors, _compute_getitem_size
 from ..utils.memoize import add_to_cache, cached
-from ..utils.qr import batch_qr
-from ..utils.svd import batch_svd
 from .lazy_tensor_representation_tree import LazyTensorRepresentationTree
 
 
@@ -76,7 +74,7 @@ class LazyTensor(ABC):
 
     .. note::
         LazyTensors are designed by default to optionally represent batches of matrices. Thus, the size of a
-        LazyTensor may be (for example) :math:`b \times n \times n`. Many of the methods are designed to efficiently
+        LazyTensor may be (for example) :math:`b \\times n \\times n`. Many of the methods are designed to efficiently
         operate on these batches if present.
     """
     def _check_args(self, *args, **kwargs):
@@ -348,7 +346,7 @@ class LazyTensor(ABC):
             else:
                 grads.append(None)
 
-        return grads
+        return tuple(grads)
 
     ####
     # Class definitions
@@ -395,12 +393,17 @@ class LazyTensor(ABC):
         from .non_lazy_tensor import NonLazyTensor
         evaluated_mat = self.evaluate()
 
+        # if the tensor is a scalar, we can just take the square root
+        if evaluated_mat.size(-1) == 1:
+            return NonLazyTensor(evaluated_mat.clamp_min(0.0).sqrt())
+
         # NOTE: this hack is in place so that the gradient of the Cholesky factorization is symmetric
         # We can remove this hack once https://github.com/pytorch/pytorch/issues/18825 is merged in
         if evaluated_mat.requires_grad:
             evaluated_mat.register_hook(_ensure_symmetric_grad)
 
-        cholesky = psd_safe_cholesky(evaluated_mat.double()).to(self.dtype)
+        # contiguous call is necessary here
+        cholesky = psd_safe_cholesky(evaluated_mat).contiguous()
         return NonLazyTensor(cholesky)
 
     def _cholesky_solve(self, rhs):
@@ -413,7 +416,7 @@ class LazyTensor(ABC):
         Returns:
             (LazyTensor) Cholesky factor
         """
-        return torch.cholesky_solve(rhs.double(), self.evaluate().double()).to(self.dtype)
+        return torch.cholesky_solve(rhs, self.evaluate())
 
     def _inv_matmul_preconditioner(self):
         """
@@ -438,9 +441,9 @@ class LazyTensor(ABC):
                     dtype=self.dtype,
                 )
                 projected_mat = self._matmul(random_basis)
-                proj_q = batch_qr(projected_mat)
+                proj_q = torch.qr(projected_mat)
                 orthog_projected_mat = self._matmul(proj_q).transpose(-2, -1)
-                U, S, V = batch_svd(orthog_projected_mat)
+                U, S, V = torch.svd(orthog_projected_mat)
                 U = proj_q.matmul(U)
 
                 self._default_preconditioner_cache = (U, S, V)
@@ -569,14 +572,20 @@ class LazyTensor(ABC):
         Returns:
             (Tensor or LazyTensor): The root of the root decomposition
         """
-        res, _ = RootDecomposition(
+        func = RootDecomposition()
+        res, _ = func.apply(
             self.representation_tree(),
-            max_iter=self._root_decomposition_size(),
-            dtype=self.dtype,
-            device=self.device,
-            batch_shape=self.batch_shape,
-            matrix_shape=self.matrix_shape,
-        )(*self.representation())
+            self._root_decomposition_size(),
+            self.dtype,
+            self.device,
+            self.batch_shape,
+            self.matrix_shape,
+            True,
+            False,
+            None,
+            *self.representation()
+        )
+
         return res
 
     def _root_decomposition_size(self):
@@ -601,17 +610,19 @@ class LazyTensor(ABC):
         """
         from .root_lazy_tensor import RootLazyTensor
 
-        roots, inv_roots = RootDecomposition(
+        func = RootDecomposition()
+        roots, inv_roots = func.apply(
             self.representation_tree(),
-            max_iter=self._root_decomposition_size(),
-            dtype=self.dtype,
-            device=self.device,
-            batch_shape=self.batch_shape,
-            matrix_shape=self.matrix_shape,
-            root=True,
-            inverse=True,
-            initial_vectors=initial_vectors,
-        )(*self.representation())
+            self._root_decomposition_size(),
+            self.dtype,
+            self.device,
+            self.batch_shape,
+            self.matrix_shape,
+            True,
+            True,
+            initial_vectors,
+            *self.representation()
+        )
 
         if initial_vectors is not None and initial_vectors.size(-1) > 1:
             add_to_cache(self, "root_decomposition", RootLazyTensor(roots[0]))
@@ -957,7 +968,7 @@ class LazyTensor(ABC):
                 "LazyTensor (size={}) and right-hand-side Tensor (size={}) should have the same number "
                 "of dimensions.".format(self.shape, tensor.shape)
             )
-        elif self.batch_shape != tensor.shape[:-2] or self.shape[-1] != tensor.shape[-2]:
+        elif self.shape[-1] != tensor.shape[-2]:
             raise RuntimeError(
                 "LazyTensor (size={}) cannot be multiplied with right-hand-side Tensor (size={}).".format(
                     self.shape, tensor.shape
@@ -1083,8 +1094,8 @@ class LazyTensor(ABC):
 
             return MatmulLazyTensor(self, other)
 
-        func = Matmul(self.representation_tree())
-        return func(other, *self.representation())
+        func = Matmul()
+        return func.apply(self.representation_tree(), other, *self.representation())
 
     @property
     def matrix_shape(self):
@@ -1340,8 +1351,12 @@ class LazyTensor(ABC):
             or settings.fast_computations.covar_root_decomposition.off()
         ):
             try:
-                res = self.cholesky()
-                res = lazify(delazify(res).double().inverse().transpose(-2, -1).to(self.dtype))
+                L = delazify(self.cholesky())
+                # we know L is triangular, so inverting is a simple triangular solve agaist the identity
+                # we don't need the batch shape here, thanks to broadcasting
+                Eye = torch.eye(L.shape[-2], device=L.device, dtype=L.dtype)
+                Linv = torch.triangular_solve(Eye, L, upper=False)[0]
+                res = lazify(Linv.transpose(-1, -2))
                 return RootLazyTensor(res)
             except RuntimeError as e:
                 warnings.warn(
@@ -1719,7 +1734,7 @@ class LazyTensor(ABC):
         return self.mul(other)
 
     def __radd__(self, other):
-        return self.mul(other)
+        return self + other
 
     def __rmul__(self, other):
         return self.mul(other)

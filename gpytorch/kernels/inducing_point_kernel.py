@@ -2,6 +2,7 @@
 
 import math
 import torch
+import copy
 from .kernel import Kernel
 from ..lazy import delazify, DiagLazyTensor, MatmulLazyTensor, RootLazyTensor, PsdSumLazyTensor
 from ..distributions import MultivariateNormal
@@ -96,3 +97,29 @@ class InducingPointKernel(Kernel):
 
     def num_outputs_per_input(self, x1, x2):
         return self.base_kernel.num_outputs_per_input(x1, x2)
+
+    def __deepcopy__(self, memo):
+        replace_inv_root = False
+        replace_kernel_mat = False
+
+        if hasattr(self, "_cached_kernel_inv_root"):
+            replace_inv_root = True
+            kernel_inv_root = self._cached_kernel_inv_root
+        if hasattr(self, "_cached_kernel_mat"):
+            replace_kernel_mat = True
+            kernel_mat = self._cached_kernel_mat
+
+        cp = self.__class__(
+            base_kernel=copy.deepcopy(self.base_kernel),
+            inducing_points=copy.deepcopy(self.inducing_points),
+            likelihood=self.likelihood,
+            active_dims=self.active_dims
+        )
+
+        if replace_inv_root:
+            cp._cached_kernel_inv_root = kernel_inv_root
+
+        if replace_kernel_mat:
+            cp._cached_kernel_mat = kernel_mat
+
+        return cp

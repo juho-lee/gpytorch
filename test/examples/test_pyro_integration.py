@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from math import pi
-import os
+import os, time
 import random
 import torch
 import unittest
@@ -61,7 +61,7 @@ try:
 
 
     class ClusterMultitaskGPModel(gpytorch.models.pyro.PyroGP):
-        def __init__(self, train_x, train_y, num_functions=2):
+        def __init__(self, train_x, train_y, num_functions=2, name_prefix=""):
             num_data = train_y.size(-2)
             
             # Define all the variational stuff
@@ -73,8 +73,8 @@ try:
             variational_strategy = MultitaskVariationalStrategy(self, inducing_points, variational_distribution)
 
             # Standard initializtation
-            likelihood = ClusterGaussianLikelihood(train_y.size(-1), num_functions, name_prefix="likelihood")
-            super().__init__(variational_strategy, likelihood, num_data=num_data, name_prefix="cluster_model")
+            likelihood = ClusterGaussianLikelihood(train_y.size(-1), num_functions, name_prefix=name_prefix)
+            super().__init__(variational_strategy, likelihood, num_data=num_data, name_prefix=name_prefix)
             self.likelihood = likelihood
 
             # Mean, covar
@@ -94,7 +94,7 @@ try:
     class TestPyroIntegration(BaseTestCase, unittest.TestCase):
         seed = 1
 
-        def test_multitask_gp_mean_abs_error(self):
+        def test_multitask_gp_mean_abs_error(self, elbo_cls=pyro.infer.Trace_ELBO):
             # Simple training data: let's try to learn sine and cosine functions
             train_x = torch.linspace(0, 1, 100)
 
@@ -107,13 +107,13 @@ try:
             # Create a train_y which interleaves the four
             train_y = torch.stack([train_y1, train_y2, train_y3, train_y4], -1)
 
-            model = ClusterMultitaskGPModel(train_x, train_y)
+            model = ClusterMultitaskGPModel(train_x, train_y, name_prefix=str(int(time.time())))
             # Find optimal model hyperparameters
             model.train()
 
             # Use the adam optimizer
             optimizer = pyro.optim.Adam({"lr": 0.03})
-            elbo = pyro.infer.Trace_ELBO(num_particles=16, vectorize_particles=True, retain_graph=True)
+            elbo = elbo_cls(num_particles=16, vectorize_particles=True, retain_graph=True)
             svi = pyro.infer.SVI(model.model, model.guide, optimizer, elbo)
 
             n_iter = 300
@@ -138,6 +138,9 @@ try:
             self.assertLess(mean_abs_error_task_2.squeeze().item(), 0.1)
             self.assertLess(mean_abs_error_task_3.squeeze().item(), 0.1)
             self.assertLess(mean_abs_error_task_4.squeeze().item(), 0.1)
+
+        def test_multitask_gp_mean_abs_error_predictive_ll(self):
+            return self.test_multitask_gp_mean_abs_error(elbo_cls=gpytorch.models.pyro.Trace_PredictiveLogLikelihood)
 
 except ImportError:
     pass
